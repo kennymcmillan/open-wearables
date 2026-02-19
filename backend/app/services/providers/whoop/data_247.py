@@ -378,6 +378,13 @@ class Whoop247Data(Base247DataTemplate):
                 task="load_and_save_all",
             )
 
+        try:
+            results["activity_samples_synced"] = self.load_and_save_activity(db, user_id, start_time, end_time)
+        except Exception as e:
+            log_structured(
+                self.logger, "error", f"Failed to sync activity data: {e}", provider="whoop", task="load_and_save_all"
+            )
+
         return results
 
     # -------------------------------------------------------------------------
@@ -710,8 +717,59 @@ class Whoop247Data(Base247DataTemplate):
         return total_count
 
     # -------------------------------------------------------------------------
-    # Activity Samples
+    # Activity Samples — WHOOP /v2/cycle
     # -------------------------------------------------------------------------
+
+    def get_cycles(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch WHOOP cycles from /v2/cycle with pagination.
+
+        Each cycle represents a physiological day and contains:
+        - strain score (0-21)
+        - kilojoules (energy expenditure)
+        - average_heart_rate and max_heart_rate
+        """
+        all_cycles: list[dict[str, Any]] = []
+        next_token = None
+        max_limit = 25  # WHOOP API page size limit
+
+        start_iso = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        while True:
+            params: dict[str, Any] = {
+                "start": start_iso,
+                "end": end_iso,
+                "limit": max_limit,
+            }
+            if next_token:
+                params["nextToken"] = next_token
+
+            try:
+                response = self._make_api_request(db, user_id, "/v2/cycle", params=params)
+                records = response.get("records", []) if isinstance(response, dict) else []
+                all_cycles.extend(records)
+                next_token = response.get("next_token") if isinstance(response, dict) else None
+                if not records or not next_token:
+                    break
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "error",
+                    f"Error fetching WHOOP cycles: {e}",
+                    provider="whoop",
+                    task="get_cycles",
+                )
+                if all_cycles:
+                    break
+                raise
+
+        return all_cycles
 
     def get_activity_samples(
         self,
@@ -720,16 +778,119 @@ class Whoop247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, Any]]:
-        """Fetch activity samples from Whoop API."""
-        return []
+        """Fetch activity samples from WHOOP /v2/cycle endpoint."""
+        return self.get_cycles(db, user_id, start_time, end_time)
 
     def normalize_activity_samples(
         self,
         raw_samples: list[dict[str, Any]],
         user_id: UUID,
     ) -> dict[str, list[dict[str, Any]]]:
-        """Normalize activity samples into categorized data."""
-        return {}
+        """Normalize WHOOP cycles into categorized time-series samples.
+
+        Returns dict with keys:
+        - physical_effort: strain score (0-21) per cycle
+        - energy: active calories (kcal) per cycle
+        - heart_rate: average heart rate per cycle
+        """
+        physical_effort_samples: list[dict[str, Any]] = []
+        energy_samples: list[dict[str, Any]] = []
+        heart_rate_samples: list[dict[str, Any]] = []
+
+        for cycle in raw_samples:
+            # Only process scored cycles
+            if cycle.get("score_state") != "SCORED":
+                continue
+
+            start = cycle.get("start")
+            if not start:
+                continue
+
+            try:
+                recorded_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                continue
+
+            score = cycle.get("score", {}) or {}
+
+            strain = score.get("strain")
+            if strain is not None:
+                physical_effort_samples.append({"timestamp": recorded_at.isoformat(), "value": float(strain)})
+
+            kilojoules = score.get("kilojoules")
+            if kilojoules is not None:
+                # Convert kJ → kcal (1 kcal = 4.184 kJ)
+                kcal = float(kilojoules) / 4.184
+                energy_samples.append({"timestamp": recorded_at.isoformat(), "value": kcal})
+
+            avg_hr = score.get("average_heart_rate")
+            if avg_hr is not None:
+                heart_rate_samples.append({"timestamp": recorded_at.isoformat(), "value": float(avg_hr)})
+
+        return {
+            "physical_effort": physical_effort_samples,
+            "energy": energy_samples,
+            "heart_rate": heart_rate_samples,
+        }
+
+    def save_activity_samples(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        normalized_samples: dict[str, list[dict[str, Any]]],
+    ) -> int:
+        """Save normalized activity samples to DataPointSeries."""
+        series_type_map = {
+            "physical_effort": SeriesType.physical_effort,
+            "energy": SeriesType.energy,
+            "heart_rate": SeriesType.heart_rate,
+        }
+
+        count = 0
+        for key, samples in normalized_samples.items():
+            series_type = series_type_map.get(key)
+            if not series_type:
+                continue
+
+            for sample in samples:
+                timestamp_str = sample.get("timestamp")
+                value = sample.get("value")
+                if not timestamp_str or value is None:
+                    continue
+                try:
+                    recorded_at = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+                    ts_sample = TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        user_id=user_id,
+                        source=self.provider_name,
+                        recorded_at=recorded_at,
+                        value=Decimal(str(value)),
+                        series_type=series_type,
+                    )
+                    timeseries_service.crud.create(db, ts_sample)
+                    count += 1
+                except Exception as e:
+                    log_structured(
+                        self.logger,
+                        "warning",
+                        f"Failed to save activity sample ({key}): {e}",
+                        provider="whoop",
+                        task="save_activity_samples",
+                    )
+
+        return count
+
+    def load_and_save_activity(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        """Load WHOOP cycles and save activity metrics to database."""
+        raw_cycles = self.get_activity_samples(db, user_id, start_time, end_time)
+        normalized = self.normalize_activity_samples(raw_cycles, user_id)
+        return self.save_activity_samples(db, user_id, normalized)
 
     # -------------------------------------------------------------------------
     # Daily Activity Statistics
@@ -742,13 +903,41 @@ class Whoop247Data(Base247DataTemplate):
         start_date: datetime,
         end_date: datetime,
     ) -> list[dict[str, Any]]:
-        """Fetch aggregated daily activity statistics."""
-        return []
+        """Fetch aggregated daily activity statistics from WHOOP /v2/cycle."""
+        return self.get_cycles(db, user_id, start_date, end_date)
 
     def normalize_daily_activity(
         self,
         raw_stats: dict[str, Any],
         user_id: UUID,
     ) -> dict[str, Any]:
-        """Normalize daily activity statistics to our schema."""
-        return {}
+        """Normalize a single WHOOP cycle into daily activity statistics.
+
+        Returns dict with: date, calories_kcal, strain, avg_heart_rate, max_heart_rate
+        """
+        if raw_stats.get("score_state") != "SCORED":
+            return {}
+
+        start = raw_stats.get("start", "")
+        score = raw_stats.get("score", {}) or {}
+
+        # Derive calendar date from cycle start (WHOOP timestamps are UTC)
+        calendar_date = None
+        if start:
+            try:
+                calendar_date = datetime.fromisoformat(start.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+            except (ValueError, AttributeError):
+                pass
+
+        kilojoules = score.get("kilojoules")
+        calories_kcal = float(kilojoules) / 4.184 if kilojoules is not None else None
+
+        return {
+            "date": calendar_date,
+            "strain": score.get("strain"),
+            "calories_kcal": calories_kcal,
+            "avg_heart_rate": score.get("average_heart_rate"),
+            "max_heart_rate": score.get("max_heart_rate"),
+            "cycle_id": raw_stats.get("id"),
+            "user_id": user_id,
+        }
