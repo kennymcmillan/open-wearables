@@ -30,7 +30,7 @@ services:
       - DB_HOST=db
       - REDIS_HOST=redis
     ports:
-      - "8081:8000"  # Exposed on :8081 to avoid conflict with VM Sports API on :8080
+      - "8085:8000"  # open-wearables backend
     depends_on:
       db:
         condition: service_healthy
